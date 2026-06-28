@@ -55,7 +55,7 @@ impl Server {
                                                 == 0
                                         {
                                             self.detector.add_sequence(
-                                                header.get_source().to_string(),
+                                                header.get_source(),
                                                 tcp.get_destination() as i32,
                                             );
                                         }

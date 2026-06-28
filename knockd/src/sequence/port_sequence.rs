@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,8 +15,8 @@ pub struct PortSequenceDetector {
     sequence_set: HashSet<i32>,
     sequence_rules: HashMap<String, Vec<i32>>,
     rules_map: HashMap<String, String>,
-    client_sequences: Arc<Mutex<HashMap<String, Vec<i32>>>>,
-    client_timeout: Arc<Mutex<HashMap<String, u64>>>,
+    client_sequences: Arc<Mutex<HashMap<Ipv4Addr, Vec<i32>>>>,
+    client_timeout: Arc<Mutex<HashMap<Ipv4Addr, u64>>>,
 }
 
 impl PortSequenceDetector {
@@ -50,7 +51,7 @@ impl PortSequenceDetector {
 }
 
 impl SequenceDetector for PortSequenceDetector {
-    fn add_sequence(&mut self, client_ip: String, sequence: i32) {
+    fn add_sequence(&mut self, client_ip: Ipv4Addr, sequence: i32) {
         // check if the sequence is in the set
         if !self.sequence_set.contains(&sequence) {
             return;
@@ -63,9 +64,7 @@ impl SequenceDetector for PortSequenceDetector {
 
         {
             let mut client_sequence = self.client_sequences.lock().unwrap();
-            let client_sequence = client_sequence
-                .entry(client_ip.clone())
-                .or_insert(Vec::new());
+            let client_sequence = client_sequence.entry(client_ip).or_default();
             client_sequence.push(sequence);
 
             // get the current time stamp
@@ -74,16 +73,16 @@ impl SequenceDetector for PortSequenceDetector {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            client_timeout.insert(client_ip.clone(), current_time);
+            client_timeout.insert(client_ip, current_time);
         }
 
-        self.match_sequence(&client_ip);
+        self.match_sequence(client_ip);
     }
 
-    fn match_sequence(&mut self, client_ip: &str) -> bool {
+    fn match_sequence(&mut self, client_ip: Ipv4Addr) -> bool {
         // Check if the current sequence matches any of the rules
         let mut client_sequence = self.client_sequences.lock().unwrap();
-        let client_sequence = client_sequence.get_mut(client_ip);
+        let client_sequence = client_sequence.get_mut(&client_ip);
         if let Some(sequence) = client_sequence {
             for (name, rule) in &self.sequence_rules {
                 if sequence.ends_with(&rule) {
@@ -93,7 +92,7 @@ impl SequenceDetector for PortSequenceDetector {
 
                     // execute the command
                     let command = self.rules_map.get(name).unwrap();
-                    let formatted_cmd = command.replace("%IP%", client_ip);
+                    let formatted_cmd = command.replace("%IP%", &client_ip.to_string());
                     info!("Executing command: {}", formatted_cmd);
 
                     // format the command with the client ip
@@ -205,9 +204,10 @@ mod tests {
     fn test_add_sequence() {
         let config = create_config();
         let mut detector = PortSequenceDetector::new(config);
-        detector.add_sequence("127.0.0.1".to_owned(), 3);
+        let client_ip = Ipv4Addr::new(127, 0, 0, 1);
+        detector.add_sequence(client_ip, 3);
         let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get("127.0.0.1"), Some(&vec![3]));
+        assert_eq!(client_sequences.get(&client_ip), Some(&vec![3]));
     }
 
     #[test]
@@ -215,31 +215,34 @@ mod tests {
         let config = create_config();
         let mut detector = PortSequenceDetector::new(config);
         detector.start();
-        detector.add_sequence("127.0.0.1".to_owned(), 3);
+        let client_ip = Ipv4Addr::new(127, 0, 0, 1);
+        detector.add_sequence(client_ip, 3);
         thread::sleep(Duration::from_secs(4));
         let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get("127.0.0.1"), None);
+        assert_eq!(client_sequences.get(&client_ip), None);
     }
 
     #[test]
     fn test_add_none_existing_sequence() {
         let config = create_config();
         let mut detector = PortSequenceDetector::new(config);
-        detector.add_sequence("127.0.0.1".to_owned(), 9);
+        let client_ip = Ipv4Addr::new(127, 0, 0, 1);
+        detector.add_sequence(client_ip, 9);
         let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get("127.0.0.1"), None);
+        assert_eq!(client_sequences.get(&client_ip), None);
     }
 
     #[test]
     fn test_match_sequence() {
         let config = create_config();
         let mut detector = PortSequenceDetector::new(config);
-        detector.add_sequence("127.0.0.1".to_owned(), 1);
-        detector.add_sequence("127.0.0.1".to_owned(), 3);
-        detector.add_sequence("127.0.0.1".to_owned(), 5);
-        detector.add_sequence("127.0.0.1".to_owned(), 6);
-        assert_eq!(detector.match_sequence("127.0.0.1"), false);
+        let client_ip = Ipv4Addr::new(127, 0, 0, 1);
+        detector.add_sequence(client_ip, 1);
+        detector.add_sequence(client_ip, 3);
+        detector.add_sequence(client_ip, 5);
+        detector.add_sequence(client_ip, 6);
+        assert_eq!(detector.match_sequence(client_ip), false);
         let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get("127.0.0.1").unwrap().len(), 0);
+        assert_eq!(client_sequences.get(&client_ip).unwrap().len(), 0);
     }
 }
