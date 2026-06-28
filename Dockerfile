@@ -24,8 +24,10 @@ FROM alpine:3.21
 # Install iptables
 RUN apk add --no-cache iptables
 
-# Create a symbolic link from /sbin/iptables to /usr/sbin/iptables
-RUN ln -s /sbin/iptables /usr/sbin/iptables
+# Ensure iptables is reachable at /usr/sbin/iptables (used by the config command).
+# On Alpine 3.21+ the /usr merge means it is already there, so only create the
+# compatibility symlink on older layouts where it would otherwise be missing.
+RUN [ -e /usr/sbin/iptables ] || ln -s /sbin/iptables /usr/sbin/iptables
 
 # Copy the binary from the builder stage
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/knockd /
