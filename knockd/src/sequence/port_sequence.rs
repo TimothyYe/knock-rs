@@ -9,14 +9,21 @@ use crate::executor;
 use crate::sequence::SequenceDetector;
 use log::{error, info};
 
+/// Per-client knock progress: the ports seen so far and the timestamp of the
+/// most recent one, used to expire stale partial sequences.
+#[derive(Debug)]
+struct ClientState {
+    sequence: Vec<i32>,
+    last_seen: u64,
+}
+
 #[derive(Debug)]
 pub struct PortSequenceDetector {
     timeout: u64,
     sequence_set: HashSet<i32>,
     sequence_rules: HashMap<String, Vec<i32>>,
     rules_map: HashMap<String, String>,
-    client_sequences: Arc<Mutex<HashMap<Ipv4Addr, Vec<i32>>>>,
-    client_timeout: Arc<Mutex<HashMap<Ipv4Addr, u64>>>,
+    clients: Arc<Mutex<HashMap<Ipv4Addr, ClientState>>>,
 }
 
 impl PortSequenceDetector {
@@ -44,9 +51,47 @@ impl PortSequenceDetector {
             sequence_set,
             sequence_rules,
             rules_map,
-            client_sequences: Arc::new(Mutex::new(HashMap::new())),
-            client_timeout: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Checks the client's recorded sequence against the configured rules while
+    /// the map is already locked, executing the first matching rule's command.
+    /// Returns whether a rule matched.
+    fn match_locked(
+        &self,
+        clients: &mut HashMap<Ipv4Addr, ClientState>,
+        client_ip: Ipv4Addr,
+    ) -> bool {
+        let Some(state) = clients.get_mut(&client_ip) else {
+            return false;
+        };
+
+        for (name, rule) in &self.sequence_rules {
+            if state.sequence.ends_with(rule) {
+                info!("Matched knock sequence: {:?} from: {}", rule, client_ip);
+                // clear the sequence
+                state.sequence.clear();
+
+                // execute the command, substituting the client IP
+                let command = self.rules_map.get(name).unwrap();
+                let formatted_cmd = command.replace("%IP%", &client_ip.to_string());
+                info!("Executing command: {}", formatted_cmd);
+
+                match executor::execute_command(&formatted_cmd) {
+                    Ok(_) => {
+                        info!("Command executed successfully");
+                    }
+                    Err(e) => {
+                        error!("Error executing command: {:?}", e);
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -62,104 +107,46 @@ impl SequenceDetector for PortSequenceDetector {
             client_ip, sequence
         );
 
-        {
-            let mut client_sequence = self.client_sequences.lock().unwrap();
-            let client_sequence = client_sequence.entry(client_ip).or_default();
-            client_sequence.push(sequence);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-            // get the current time stamp
-            let mut client_timeout = self.client_timeout.lock().unwrap();
-            let current_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            client_timeout.insert(client_ip, current_time);
-        }
+        // Record the port and match against the rules under a single lock.
+        let mut clients = self.clients.lock().unwrap();
+        let state = clients.entry(client_ip).or_insert_with(|| ClientState {
+            sequence: Vec::new(),
+            last_seen: now,
+        });
+        state.sequence.push(sequence);
+        state.last_seen = now;
 
-        self.match_sequence(client_ip);
-    }
-
-    fn match_sequence(&mut self, client_ip: Ipv4Addr) -> bool {
-        // Check if the current sequence matches any of the rules
-        let mut client_sequence = self.client_sequences.lock().unwrap();
-        let client_sequence = client_sequence.get_mut(&client_ip);
-        if let Some(sequence) = client_sequence {
-            for (name, rule) in &self.sequence_rules {
-                if sequence.ends_with(&rule) {
-                    info!("Matched knock sequence: {:?} from: {}", rule, client_ip);
-                    // clear the sequence
-                    sequence.clear();
-
-                    // execute the command
-                    let command = self.rules_map.get(name).unwrap();
-                    let formatted_cmd = command.replace("%IP%", &client_ip.to_string());
-                    info!("Executing command: {}", formatted_cmd);
-
-                    // format the command with the client ip
-                    match executor::execute_command(&formatted_cmd) {
-                        Ok(_) => {
-                            info!("Command executed successfully");
-                        }
-                        Err(e) => {
-                            error!("Error executing command: {:?}", e);
-                        }
-                    }
-
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.match_locked(&mut clients, client_ip);
     }
 
     fn start(&mut self) {
-        let client_sequences = Arc::clone(&self.client_sequences);
-        let client_timeout = Arc::clone(&self.client_timeout);
+        let clients = Arc::clone(&self.clients);
         let timeout = self.timeout;
 
         thread::spawn(move || loop {
             thread::sleep(std::time::Duration::from_millis(200));
 
-            let client_sequences_guard = match client_sequences.lock() {
+            let mut clients = match clients.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
                     error!("Error: {:?}", poisoned);
                     continue;
                 }
             };
-
-            let client_timeout_guard = match client_timeout.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    error!("Error: {:?}", poisoned);
-                    continue;
-                }
-            };
-
-            let mut client_sequences = client_sequences_guard;
-            let mut client_timeout = client_timeout_guard;
 
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
 
-            let clients_to_remove: Vec<_> = client_timeout
-                .iter()
-                .filter_map(|(client_ip, _)| {
-                    let last_time = client_timeout.get(client_ip).unwrap();
-                    if now - last_time > timeout {
-                        return Some(client_ip.clone());
-                    }
-                    None
-                })
-                .collect();
-
-            for client_ip in clients_to_remove {
-                client_sequences.remove(&client_ip);
-                client_timeout.remove(&client_ip);
-            }
+            // Drop clients whose last knock is older than the timeout.
+            // saturating_sub guards against a backwards clock step.
+            clients.retain(|_, state| now.saturating_sub(state.last_seen) <= timeout);
         });
 
         info!("Port sequence detector thread started...");
@@ -206,8 +193,8 @@ mod tests {
         let mut detector = PortSequenceDetector::new(config);
         let client_ip = Ipv4Addr::new(127, 0, 0, 1);
         detector.add_sequence(client_ip, 3);
-        let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get(&client_ip), Some(&vec![3]));
+        let clients = detector.clients.lock().unwrap();
+        assert_eq!(clients.get(&client_ip).unwrap().sequence, vec![3]);
     }
 
     #[test]
@@ -218,8 +205,8 @@ mod tests {
         let client_ip = Ipv4Addr::new(127, 0, 0, 1);
         detector.add_sequence(client_ip, 3);
         thread::sleep(Duration::from_secs(4));
-        let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get(&client_ip), None);
+        let clients = detector.clients.lock().unwrap();
+        assert!(clients.get(&client_ip).is_none());
     }
 
     #[test]
@@ -228,8 +215,8 @@ mod tests {
         let mut detector = PortSequenceDetector::new(config);
         let client_ip = Ipv4Addr::new(127, 0, 0, 1);
         detector.add_sequence(client_ip, 9);
-        let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get(&client_ip), None);
+        let clients = detector.clients.lock().unwrap();
+        assert!(clients.get(&client_ip).is_none());
     }
 
     #[test]
@@ -241,8 +228,9 @@ mod tests {
         detector.add_sequence(client_ip, 3);
         detector.add_sequence(client_ip, 5);
         detector.add_sequence(client_ip, 6);
-        assert_eq!(detector.match_sequence(client_ip), false);
-        let client_sequences = detector.client_sequences.lock().unwrap();
-        assert_eq!(client_sequences.get(&client_ip).unwrap().len(), 0);
+        // The [3, 5, 6] suffix matches the "disable ssh" rule, which clears the
+        // recorded sequence after running its command.
+        let clients = detector.clients.lock().unwrap();
+        assert_eq!(clients.get(&client_ip).unwrap().sequence.len(), 0);
     }
 }
