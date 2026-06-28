@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::Config;
+use crate::config::{Config, Rule};
 use crate::executor;
 use crate::sequence::SequenceDetector;
 use log::{error, info};
@@ -21,36 +21,25 @@ struct ClientState {
 pub struct PortSequenceDetector {
     timeout: u64,
     sequence_set: HashSet<i32>,
-    sequence_rules: HashMap<String, Vec<i32>>,
-    rules_map: HashMap<String, String>,
+    rules: Vec<Rule>,
     clients: Arc<Mutex<HashMap<Ipv4Addr, ClientState>>>,
 }
 
 impl PortSequenceDetector {
     #[must_use]
     pub fn new(config: Config) -> PortSequenceDetector {
-        let mut sequence_rules = HashMap::new();
-        for rule in config.rules.clone() {
-            sequence_rules.insert(rule.name, rule.sequence);
-        }
-
-        let mut sequence_set = HashSet::new();
-        for rule in config.rules.clone() {
-            for sequence in rule.sequence {
-                sequence_set.insert(sequence);
-            }
-        }
-
-        let mut rules_map = HashMap::new();
-        for rule in config.rules {
-            rules_map.insert(rule.name, rule.command);
-        }
+        // Collect every port referenced by any rule for a fast relevance check,
+        // then take ownership of the rules without cloning them.
+        let sequence_set: HashSet<i32> = config
+            .rules
+            .iter()
+            .flat_map(|rule| rule.sequence.iter().copied())
+            .collect();
 
         PortSequenceDetector {
             timeout: config.timeout,
             sequence_set,
-            sequence_rules,
-            rules_map,
+            rules: config.rules,
             clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -67,15 +56,17 @@ impl PortSequenceDetector {
             return false;
         };
 
-        for (name, rule) in &self.sequence_rules {
-            if state.sequence.ends_with(rule) {
-                info!("Matched knock sequence: {:?} from: {}", rule, client_ip);
+        for rule in &self.rules {
+            if state.sequence.ends_with(&rule.sequence) {
+                info!(
+                    "Matched knock sequence: {:?} from: {}",
+                    rule.sequence, client_ip
+                );
                 // clear the sequence
                 state.sequence.clear();
 
                 // execute the command, substituting the client IP
-                let command = self.rules_map.get(name).unwrap();
-                let formatted_cmd = command.replace("%IP%", &client_ip.to_string());
+                let formatted_cmd = rule.command.replace("%IP%", &client_ip.to_string());
                 info!("Executing command: {}", formatted_cmd);
 
                 match executor::execute_command(&formatted_cmd) {
@@ -183,7 +174,7 @@ mod tests {
         let config = create_config();
         let detector = PortSequenceDetector::new(config);
         assert_eq!(detector.sequence_set.len(), 5);
-        assert_eq!(detector.sequence_rules.len(), 2);
+        assert_eq!(detector.rules.len(), 2);
         assert_eq!(detector.timeout, 2);
     }
 
