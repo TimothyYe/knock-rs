@@ -104,7 +104,12 @@ impl SequenceDetector for PortSequenceDetector {
             .as_secs();
 
         // Record the port and match against the rules under a single lock.
-        let mut clients = self.clients.lock().unwrap();
+        // Recover the guard if another thread poisoned the mutex by panicking;
+        // the per-client entries have no cross-entry invariant to corrupt.
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = clients.entry(client_ip).or_insert_with(|| ClientState {
             sequence: Vec::new(),
             last_seen: now,

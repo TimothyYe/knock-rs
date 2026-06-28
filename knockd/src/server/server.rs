@@ -1,4 +1,5 @@
 use crate::sequence::SequenceDetector;
+use log::error;
 use pnet::datalink::Channel::Ethernet;
 use pnet::datalink::{self, NetworkInterface};
 use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
@@ -41,7 +42,10 @@ impl Server {
         loop {
             match rx.next() {
                 Ok(packet) => {
-                    let packet = EthernetPacket::new(packet).unwrap();
+                    let Some(packet) = EthernetPacket::new(packet) else {
+                        // Skip malformed or truncated frames instead of crashing.
+                        continue;
+                    };
                     match packet.get_ethertype() {
                         EtherTypes::Ipv4 => {
                             if let Some(header) =
@@ -67,7 +71,7 @@ impl Server {
                     }
                 }
                 Err(e) => {
-                    panic!("An error occurred while reading: {}", e);
+                    error!("An error occurred while reading: {}", e);
                 }
             }
         }
