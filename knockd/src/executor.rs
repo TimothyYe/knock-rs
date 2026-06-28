@@ -1,12 +1,13 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::process::Command;
 
 pub fn execute_command(command: &str) -> Result<()> {
     let mut parts = command.split_whitespace();
-    let command = parts.next().unwrap();
-    let args = parts;
+    let Some(program) = parts.next() else {
+        bail!("cannot execute an empty command");
+    };
 
-    Command::new(command).args(args).spawn()?.wait()?;
+    Command::new(program).args(parts).spawn()?.wait()?;
 
     Ok(())
 }

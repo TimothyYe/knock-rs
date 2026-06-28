@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::fs::File;
 use std::io::Read;
 
-pub use config::Config;
+pub use config::{Config, Rule};
 pub mod config;
 
 pub fn load_config(path: &str) -> Result<Config> {
