@@ -10,7 +10,7 @@ pub fn load_config(path: &str) -> Result<Config> {
     let mut content = String::new();
 
     file.read_to_string(&mut content)?;
-    let config: Config = serde_yaml::from_str(&content)?;
+    let config: Config = serde_yaml_ng::from_str(&content)?;
 
     Ok(config)
 }
